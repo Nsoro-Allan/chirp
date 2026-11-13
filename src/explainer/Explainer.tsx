@@ -86,7 +86,7 @@ export default function Explainer() {
       body: (
         <>
           <header className="ex-head">
-            <h1 id="explainer-title">HOW CHIRP WORKS</h1>
+            <h1 id="explainer-title">How Chirp Works</h1>
           </header>
           <p className="ex-dek">
             Two devices, a speaker and a microphone, no network. This is how it works, starting with the simplest version that

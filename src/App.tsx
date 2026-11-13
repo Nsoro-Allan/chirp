@@ -1,6 +1,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import Spectrum from './components/Spectrum';
 import { play, startCapture, type Capture } from './audio/audioIO';
+import { encodeWav, downloadBlob } from './audio/wav';
 import {
   FileAssembler,
   MAX_FILE_BYTES,
@@ -71,21 +72,18 @@ interface TxMode {
 const ENCRYPTED_LABEL = 'ENCRYPTED';
 const ENCRYPTED_CARRIER = getModem('fast');
 
-const MODES: TxMode[] = [
-  ...MODEMS.map((m) => ({ id: m.id, label: m.label, description: m.description, modem: m, encrypted: false, maxPayload: m.maxPayload })),
-  {
-    id: 'encrypted',
-    label: ENCRYPTED_LABEL,
-    description: `${ENCRYPTED_CARRIER.label} tones, sealed with an AES-256-GCM key: only a device with the same key can communicate`,
-    // The carrier, labelled as this mode so the status bar and spectrum say ENCRYPTED.
-    modem: { ...ENCRYPTED_CARRIER, label: ENCRYPTED_LABEL },
-    encrypted: true,
-    maxPayload: ENCRYPTED_CARRIER.maxPayload - ENCRYPTION_OVERHEAD,
-  },
-];
+// Physical modes only. Encryption is now an independent toggle that can be applied
+// on top of any of these modes.
+const MODES: TxMode[] = MODEMS.map((m) => ({
+  id: m.id,
+  label: m.label,
+  description: m.description,
+  modem: m,
+  encrypted: false,
+  maxPayload: m.maxPayload,
+}));
 
 const getMode = (id: string) => MODES.find((m) => m.id === id) ?? MODES[0];
-const ENCRYPTED_MODE = getMode('encrypted');
 
 // How long a caller listens for a handshake reply: the answering device's delay
 // and the reply's airtime, plus room for decoding and a moment of channel wait.
@@ -209,14 +207,18 @@ const cleanText = (s: string) => s.replace(CONTROL_CHARS, '');
 
 const decodeText = (bytes: Uint8Array) => cleanText(new TextDecoder().decode(bytes));
 
-const goodput = (mode: TxMode) => Math.round((100 * 8) / mode.modem.airtime(100 + (mode.encrypted ? ENCRYPTION_OVERHEAD : 0)));
+const goodput = (mode: TxMode, encrypted = false) =>
+  Math.round((100 * 8) / mode.modem.airtime(100 + (encrypted ? ENCRYPTION_OVERHEAD : 0)));
 
 /** Airtime of a message of this many bytes once it is framed (and sealed) for a mode. */
-const messageAirtime = (mode: TxMode, bytes: number) => mode.modem.airtime(bytes + (mode.encrypted ? ENCRYPTION_OVERHEAD : 0));
+const messageAirtime = (mode: TxMode, bytes: number, encrypted = false) =>
+  mode.modem.airtime(bytes + (encrypted ? ENCRYPTION_OVERHEAD : 0));
 
 /** Stand-ins the size of the frames a mode will play, for estimating airtime before sealing. */
-const asPlayed = (mode: TxMode, frames: Frame[]): Frame[] =>
-  mode.encrypted ? frames.map((f) => ({ type: FrameType.Encrypted, payload: new Uint8Array(f.payload.length + ENCRYPTION_OVERHEAD) })) : frames;
+const asPlayed = (frames: Frame[], encrypted: boolean): Frame[] =>
+  encrypted
+    ? frames.map((f) => ({ type: FrameType.Encrypted, payload: new Uint8Array(f.payload.length + ENCRYPTION_OVERHEAD) }))
+    : frames;
 
 const sealAll = async (passphrase: string, frames: Frame[]) => {
   const key = await deriveKey(passphrase);
@@ -276,11 +278,7 @@ function Panel({
   return (
     <section className={`panel ${className ?? ''}`} aria-label={title}>
       <header className="panel-title">
-        <span>
-          <span aria-hidden="true">┤ </span>
-          <h2 className="panel-name">{title}</h2>
-          <span aria-hidden="true"> ├</span>
-        </span>
+        <h2 className="panel-name">{title}</h2>
         {right !== undefined && <span className="panel-right">{right}</span>}
       </header>
       {children}
@@ -288,7 +286,7 @@ function Panel({
   );
 }
 
-const TAG_TEXT: Record<Tag, string> = { rx: 'RX', tx: 'TX', err: '!!', warn: '??', sys: '--' };
+const TAG_TEXT: Record<Tag, string> = { rx: 'RX', tx: 'TX', err: 'ERR', warn: 'WARN', sys: 'SYS' };
 
 /** The note, with "RETRY MIC" as a button when the row offers it and it would do something. */
 function LogNote({ line, retryMic }: { line: LogLine; retryMic?: () => void }) {
@@ -372,14 +370,18 @@ function App() {
   // Open where there's room; on phones and short windows the composer below the spectrum comes first.
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(() => window.matchMedia('(min-width: 901px) and (min-height: 800px)').matches);
   const [spectrumOpen, setSpectrumOpen] = useState(true);
+  // Encryption is now a toggle that can be applied to any physical mode (FAST / ROBUST / INAUDIBLE).
+  const [encryptEnabled, setEncryptEnabled] = useState(false);
   // Kept in memory only: never stored, so closing the tab forgets it.
   const [psk, setPsk] = useState('');
   const [showKey, setShowKey] = useState(false);
   // Whether the key was filled in by GENERATE and not edited since. A flag, so no second copy of the secret is kept.
   const [keyGenerated, setKeyGenerated] = useState(false);
-  // Two-way (PSK + Diffie–Hellman) sessions: off by default, so ENCRYPTED stays one-way. Never stored.
+  // Two-way (PSK + Diffie–Hellman) sessions: off by default. Only relevant when encryption is on.
   const [twoWay, setTwoWay] = useState(false);
   const [session, setSession] = useState<SessionInfo | null>(null);
+  // Last transmission audio samples (for export).
+  const [lastTxAudio, setLastTxAudio] = useState<{ samples: Float32Array; sampleRate: number; label: string } | null>(null);
   // Already applied by main.tsx before the first render; this mirrors it.
   const [theme, setTheme] = useState<Theme>(initialTheme);
 
@@ -408,6 +410,7 @@ function App() {
   const stickToBottomRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
   // The normalised key; written only by changeKey.
   const pskRef = useRef('');
   // Goes up whenever the key changes. Encrypted transfers, RESEND's file id and decryptions in flight belong
@@ -526,7 +529,7 @@ function App() {
           .run('handshake answer', async () => {
             // Listen before talk holds it for TURNAROUND_MS after the hello, until the caller listens again.
             await audioForPlayback();
-            return { modem: ENCRYPTED_MODE.modem, frames: [frame] };
+            return { modem: ENCRYPTED_CARRIER, frames: [frame] };
           })
           .then((outcome) => {
             if (outcome.status === 'sent') addLine({ tag: 'sys', mode: ENCRYPTED_LABEL, text: 'answered a two-way handshake' });
@@ -845,7 +848,7 @@ function App() {
   ): Promise<{ frames: Frame[]; session?: string }> => {
     if (!o.twoWay) return { frames: await sealAll(o.passphrase, frames) };
     const s = await sessions.establish(
-      (frame, signal) => o.context.say(ENCRYPTED_MODE.modem, [frame], signal),
+      (frame, signal) => o.context.say(ENCRYPTED_CARRIER, [frame], signal),
       o.signal,
       (text) => {
         o.context.status(text);
@@ -871,13 +874,15 @@ function App() {
     const mode = getMode(modeRef.current);
     const m = mode.modem;
     const passphrase = pskRef.current;
-    const twoWay = mode.encrypted && twoWayRef.current;
+    const useEncrypt = encryptEnabled && !!passphrase;
+    const twoWay = useEncrypt && twoWayRef.current;
     const payload = new TextEncoder().encode(text);
-    if (payload.length > mode.maxPayload) {
-      addLine({ tag: 'err', mode: m.label, text: `message too long (${payload.length}/${mode.maxPayload} bytes)` });
+    const maxPayload = useEncrypt ? m.maxPayload - ENCRYPTION_OVERHEAD : m.maxPayload;
+    if (payload.length > maxPayload) {
+      addLine({ tag: 'err', mode: m.label, text: `message too long (${payload.length}/${maxPayload} bytes)` });
       return;
     }
-    if (mode.encrypted && !passphrase) {
+    if (encryptEnabled && !passphrase) {
       addLine({ tag: 'err', mode: m.label, text: 'not sent · enter a pre-shared key first' });
       return;
     }
@@ -894,9 +899,9 @@ function App() {
       async (signal, context) => {
         await audioForPlayback();
         const frames = [{ type: FrameType.Text, payload }];
-        if (!mode.encrypted) return { modem: m, frames };
+        if (!useEncrypt) return { modem: m, frames };
         const sealed = await seal(frames, { passphrase, twoWay, signal, context, onStatus: (note) => updateLine(lineId, { note }) });
-        via = sealed.session ? ` · two-way · session ${sessionCode(sealed.session)}` : ' · PSK only';
+        via = sealed.session ? ` · encrypted · two-way · session ${sessionCode(sealed.session)}` : ' · encrypted';
         return { modem: m, frames: sealed.frames };
       },
       (s) => updateLine(lineId, { progress: s.progress }),
@@ -931,9 +936,10 @@ function App() {
     const mode = getMode(modeRef.current);
     const m = mode.modem;
     const passphrase = pskRef.current;
-    const twoWay = mode.encrypted && twoWayRef.current;
+    const useEncrypt = encryptEnabled && !!passphrase;
+    const twoWay = useEncrypt && twoWayRef.current;
     const keyContext = keyContextRef.current;
-    if (mode.encrypted && !passphrase) {
+    if (encryptEnabled && !passphrase) {
       addLine({ tag: 'err', mode: m.label, text: file.name, note: 'not sent · enter a pre-shared key first' });
       return;
     }
@@ -956,8 +962,9 @@ function App() {
         if (signal.aborted) return null;
         // A changed key starts a new transfer: receivers assemble each key's frames apart.
         const sameContext =
-          reuse && reuse.modemId === mode.id && (!mode.encrypted || (reuse.keyContext === keyContext && reuse.twoWay === twoWay));
+          reuse && reuse.modemId === mode.id && (!useEncrypt || (reuse.keyContext === keyContext && reuse.twoWay === twoWay));
         const fileId = reuse && sameContext ? reuse.fileId : newFileId();
+        const effectiveMax = useEncrypt ? m.maxPayload - ENCRYPTION_OVERHEAD : m.maxPayload;
         const build = (target: { rawBitRate: number; maxPayload: number }) =>
           buildFileFrames({
             fileId,
@@ -968,13 +975,13 @@ function App() {
             compressed,
             chunkSize: chunkSizeFor(target),
           }).frames;
-        const frames = build(mode.encrypted ? { rawBitRate: m.rawBitRate, maxPayload: mode.maxPayload } : m);
-        const eta = airtimeOf(m, asPlayed(mode, frames));
+        const frames = build(useEncrypt ? { rawBitRate: m.rawBitRate, maxPayload: effectiveMax } : m);
+        const eta = airtimeOf(m, asPlayed(frames, useEncrypt));
         if (eta > MAX_AIRTIME_S) {
           const fast = MODEMS[0];
           const fastEta = airtimeOf(fast, build(fast));
           const hint =
-            !mode.encrypted && m.id !== fast.id && fastEta <= MAX_AIRTIME_S
+            !useEncrypt && m.id !== fast.id && fastEta <= MAX_AIRTIME_S
               ? `try ${fast.label} (~${formatSeconds(fastEta)})`
               : 'send a smaller or more compressible file';
           throw new Error(`would take ~${formatSeconds(eta)} in ${m.label}; the limit is ${formatSeconds(MAX_AIRTIME_S)} · ${hint}`);
@@ -991,7 +998,7 @@ function App() {
         lineId = id;
         // Sealed only now, so time spent confirming does not age the timestamps. Every frame is
         // sealed on its own, so a receiver can open chunks in any order and RESEND still fills gaps.
-        if (!mode.encrypted) return { modem: m, frames };
+        if (!useEncrypt) return { modem: m, frames };
         const sealed = await seal(frames, {
           passphrase,
           twoWay,
@@ -999,7 +1006,7 @@ function App() {
           context,
           onStatus: (note) => updateLine(id, { note: note ? `${size} · ${note}` : size }),
         });
-        size += sealed.session ? ` · two-way · session ${sessionCode(sealed.session)}` : ' · PSK only';
+        size += sealed.session ? ` · encrypted · two-way · session ${sessionCode(sealed.session)}` : ' · encrypted';
         if (signal.aborted) return null;
         return { modem: m, frames: sealed.frames };
       },
@@ -1060,7 +1067,7 @@ function App() {
     // Tests the carrier only; the test frame is never encrypted.
     const testMode = getMode(modeRef.current);
     const m = testMode.modem;
-    const heard = testMode.encrypted ? `${ENCRYPTED_CARRIER.label} audio (the key is not checked)` : `${m.label} signal`;
+    const heard = `${m.label} signal`;
     const nonce = crypto.getRandomValues(new Uint8Array(8));
     let resolve!: () => void;
     const done = new Promise<void>((r) => (resolve = r));
@@ -1098,6 +1105,106 @@ function App() {
         note: "failed · couldn't hear itself · raise the volume, avoid Bluetooth, or try another mode",
       });
       announce(`Loopback test failed for ${m.label}`);
+    }
+  };
+
+  /** Re-modulate the current message (or last file) and download it as a WAV. */
+  const exportTransmission = async () => {
+    const mode = getMode(modeRef.current);
+    const m = mode.modem;
+    const passphrase = pskRef.current;
+    const useEncrypt = encryptEnabled && !!passphrase;
+    const rate = sampleRate;
+
+    try {
+      await audioForPlayback();
+      let frames: Frame[];
+      let label: string;
+
+      if (inputText.trim()) {
+        const payload = new TextEncoder().encode(inputText.trim());
+        const maxPayload = useEncrypt ? m.maxPayload - ENCRYPTION_OVERHEAD : m.maxPayload;
+        if (payload.length > maxPayload) {
+          addLine({ tag: 'err', text: 'message too long to export' });
+          return;
+        }
+        frames = [{ type: FrameType.Text, payload }];
+        label = 'message';
+      } else if (lastFile) {
+        addLine({ tag: 'sys', text: 'Export uses the text in the box, or re-send the file to capture it' });
+        return;
+      } else {
+        addLine({ tag: 'warn', text: 'Type a message first, then Export' });
+        return;
+      }
+
+      if (useEncrypt) {
+        frames = await sealAll(passphrase, frames);
+      }
+
+      // Concatenate all frame audio with small gaps.
+      const parts: Float32Array[] = [];
+      let total = 0;
+      for (const frame of frames) {
+        const samples = m.modulate(frame, rate);
+        parts.push(samples);
+        total += samples.length;
+        // small gap
+        const gap = new Float32Array(Math.round(rate * 0.05));
+        parts.push(gap);
+        total += gap.length;
+      }
+      const combined = new Float32Array(total);
+      let offset = 0;
+      for (const p of parts) {
+        combined.set(p, offset);
+        offset += p.length;
+      }
+
+      const blob = encodeWav(combined, rate);
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      downloadBlob(blob, `chirp-${mode.id}${useEncrypt ? '-enc' : ''}-${stamp}.wav`);
+      setLastTxAudio({ samples: combined, sampleRate: rate, label });
+      addLine({
+        tag: 'sys',
+        mode: m.label,
+        text: `exported ${label}`,
+        note: `${formatBytes(blob.size)} WAV · ${useEncrypt ? 'encrypted' : 'plain'}`,
+      });
+    } catch (err) {
+      addLine({ tag: 'err', text: 'export failed', note: err instanceof Error ? err.message : String(err) });
+    }
+  };
+
+  /** Load an audio file and feed its samples through the demodulators. */
+  const importAudioFile = async (file: File) => {
+    try {
+      await startAudio();
+      const ctx = audioContextRef.current!;
+      const buffer = await file.arrayBuffer();
+      const audioBuffer = await ctx.decodeAudioData(buffer.slice(0));
+      const samples = audioBuffer.getChannelData(0);
+      const rate = audioBuffer.sampleRate;
+
+      // Build demodulators for this file's sample rate.
+      const demods = new Map(
+        MODEMS.filter((m) => m.supports(rate)).map((m) => [m.id, m.createDemodulator(rate)]),
+      );
+
+      addLine({ tag: 'sys', text: `importing ${file.name}`, note: `${formatBytes(file.size)} · ${rate} Hz · decoding…` });
+
+      const CHUNK = 2048;
+      for (let i = 0; i < samples.length; i += CHUNK) {
+        const chunk = samples.subarray(i, Math.min(i + CHUNK, samples.length));
+        const mono = chunk instanceof Float32Array ? chunk : new Float32Array(chunk);
+        for (const demod of demods.values()) {
+          const events = demod.process(mono);
+          for (const e of events) handleEventRef.current(e);
+        }
+      }
+      addLine({ tag: 'sys', text: `finished importing ${file.name}` });
+    } catch (err) {
+      addLine({ tag: 'err', text: 'import failed', note: err instanceof Error ? err.message : String(err) });
     }
   };
 
@@ -1252,18 +1359,21 @@ function App() {
     if (audioContextRef.current?.state !== 'running') startAudio();
   };
 
-  const payloadBytes = new TextEncoder().encode(inputText).length;
-  const overLimit = payloadBytes > mode.maxPayload;
   const keyChars = Array.from(normalizeKey(psk)).length;
-  const keyMissing = mode.encrypted && keyChars === 0;
+  // Encryption is active only when the user turns it on and has entered a key.
+  const isEncrypted = encryptEnabled && keyChars > 0;
+  const effectiveMaxPayload = isEncrypted ? mode.modem.maxPayload - ENCRYPTION_OVERHEAD : mode.modem.maxPayload;
+  const payloadBytes = new TextEncoder().encode(inputText).length;
+  const overLimit = payloadBytes > effectiveMaxPayload;
+  const keyMissing = encryptEnabled && keyChars === 0;
   const keyHint =
     keyChars === 0
-      ? 'needed to send and to read · kept in memory only'
+      ? 'Enter a key to encrypt messages, or Generate one'
       : keyGenerated
-        ? 'random key · type it exactly on the other device'
+        ? 'Random key · share it securely with the other device'
         : keyChars < MIN_KEY_CHARS
-          ? `${keyChars} chars · too short to resist guessing · use 5+ random words or GENERATE`
-          : `${keyChars} chars · random words · case-sensitive`;
+          ? `${keyChars} chars · short keys are easy to guess · use 5+ random words or Generate`
+          : `${keyChars} chars · case-sensitive`;
   const maxFrequency = Math.min(20000, sampleRate / 2);
   const audioRunning = audioState === 'running';
 
@@ -1312,8 +1422,8 @@ function App() {
   return (
     <div className="app" onClick={handleUserInteraction}>
       <header className="topbar">
-        <span className="brand">▚▞ CHIRP</span>
-        <span className="dim topbar-sub">acoustic modem</span>
+        <span className="brand">Chirp.</span>
+        <span className="topbar-sub">[Acoustic modem]</span>
         <span className="spacer" />
         <span className={`state ${state.className}`}>{state.text}</span>
         {state.actions.map((action, i) => (
@@ -1325,13 +1435,12 @@ function App() {
               action.run();
             }}
           >
-            [ {action.label} ]
+            {action.label}
           </button>
         ))}
-        <span className="dim topbar-sub">
-          {(sampleRate / 1000).toFixed(1)}kHz · {captureMethod}
+        <span className="topbar-sub">
+          {(sampleRate / 1000).toFixed(1)} kHz · {captureMethod}
         </span>
-        {/* Names the theme it switches to. The explainer has no toggle: it stays dark. */}
         <button
           className="btn theme-toggle"
           aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
@@ -1343,7 +1452,7 @@ function App() {
             setTheme(next);
           }}
         >
-          [ {theme === 'dark' ? '☀ LIGHT' : '☾ DARK'} ]
+          {theme === 'dark' ? 'Light' : 'Dark'}
         </button>
       </header>
       <div className="sr-only" aria-live="polite" aria-atomic="true">
@@ -1351,9 +1460,9 @@ function App() {
       </div>
 
       <main className="screen">
-        <Panel title="SPECTRUM" right={`mic input · 0–${maxFrequency / 1000}kHz`} className="p-spectrum">
+        <Panel title="Spectrum" right={`Mic · 0–${maxFrequency / 1000} kHz`} className="p-spectrum">
           <details open={spectrumOpen} onToggle={(e) => setSpectrumOpen(e.currentTarget.open)}>
-            <summary className="dim">{spectrumOpen ? 'hide' : 'show'}</summary>
+            <summary className="dim">{spectrumOpen ? 'Hide spectrum' : 'Show spectrum'}</summary>
             {/* Unmounted while collapsed, which also stops its animation loop. */}
             {spectrumOpen && (
               <Spectrum
@@ -1420,9 +1529,9 @@ function App() {
           </details>
         </Panel>
 
-        <Panel title="TRANSMIT" right={<span className="hotkey-hint">alt+1–{MODES.length} mode</span>} className="p-tx">
+        <Panel title="Compose" right={<span className="hotkey-hint">alt+1–{MODES.length} mode</span>} className="p-tx">
           <fieldset className="modes" disabled={txBusy}>
-            <legend className="field-label">MODE</legend>
+            <legend className="field-label">Transmission mode</legend>
             {MODES.map((m, i) => {
               const supported = m.modem.supports(sampleRate);
               const active = m.id === modeId;
@@ -1440,9 +1549,7 @@ function App() {
                     disabled={!supported}
                     onChange={() => selectMode(m.id)}
                   />
-                  <span className="mode-radio" aria-hidden="true">
-                    {active ? '(•)' : '( )'}
-                  </span>
+                  <span className="mode-radio" aria-hidden="true" />
                   <span className="mode-name">{m.label}</span>
                   <span className="mode-band">{formatBand(m.modem.band)}</span>
                   <span className="mode-rate">~{goodput(m)} b/s</span>
@@ -1455,83 +1562,96 @@ function App() {
           </fieldset>
           <div className="mode-hint">
             <span className="mode-hint-specs">
-              ~{goodput(mode)} b/s · {formatBand(modem.band)} ·{' '}
+              ~{goodput(mode, isEncrypted)} b/s · {formatBand(modem.band)} ·{' '}
             </span>
             {mode.description}
           </div>
 
-          {mode.encrypted && (
-            <>
-              <label className="field-label" htmlFor="psk">
-                PRE-SHARED KEY
-              </label>
-              <div className="prompt">
-                <span className="prompt-sign" aria-hidden="true">
-                  #
-                </span>
-                {/* Masked unless shown, against shoulder-surfing and screen sharing. Locked while sending: the job already holds its key. */}
-                <input
-                  id="psk"
-                  type={showKey ? 'text' : 'password'}
-                  value={psk}
-                  disabled={txBusy}
-                  spellCheck={false}
-                  autoComplete="off"
-                  autoCapitalize="none"
-                  autoCorrect="off"
-                  aria-describedby="psk-meta"
-                  onChange={(e) => changeKey(e.target.value, false)}
-                  onKeyDown={(e) => {
-                    // Enter that confirms an IME composition must not move on.
-                    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-                    if (e.key === 'Enter') {
-                      e.preventDefault();
-                      inputRef.current?.focus();
-                    }
-                  }}
-                  placeholder="type a 20+ character key, same on both devices"
-                />
-              </div>
-              <div id="psk-meta" className={`tx-meta${!keyGenerated && keyChars > 0 && keyChars < MIN_KEY_CHARS ? ' warn' : ''}`}>
-                {keyHint}
-              </div>
-              {/* A row of their own, so the key gets the full width and a generated key can be read out in one go. */}
-              <div className="actions key-actions">
-                <button className="btn" onClick={() => setShowKey((v) => !v)}>
-                  [ {showKey ? 'HIDE' : 'SHOW'} ]
-                </button>
-                <button
-                  className="btn"
-                  disabled={txBusy}
-                  title="Fill in a random 25-character key"
-                  onClick={() => {
-                    changeKey(generateKey(), true);
-                    // It has to be read out to the other device.
-                    setShowKey(true);
-                  }}
-                >
-                  [ GENERATE ]
-                </button>
-              </div>
-              {/* Off by default: one-way sending needs no microphone on the sender and no answer.
-                  Boxed with its status and explanation, so they read as one optional extra. */}
-              <div className="two-way-group" role="group" aria-label="Optional: two-way sessions">
-                <span className="two-way-tag" aria-hidden="true">
-                  optional
-                </span>
-                <label className={`two-way${txBusy ? ' disabled' : ''}`}>
+          {/* Encryption is now an independent toggle that works with any mode */}
+          <div className="two-way-group" role="group" aria-label="Encryption">
+            <span className="two-way-tag" aria-hidden="true">
+              security
+            </span>
+            <label className={`two-way${txBusy ? ' disabled' : ''}`}>
+              <input
+                type="checkbox"
+                checked={encryptEnabled}
+                disabled={txBusy}
+                onChange={(e) => {
+                  setEncryptEnabled(e.target.checked);
+                  if (!e.target.checked) {
+                    setTwoWay(false);
+                  }
+                }}
+              />
+              <span className={`two-way-state ${encryptEnabled ? 'on' : 'off'}`} aria-hidden="true">
+                {encryptEnabled ? 'ON' : 'OFF'}
+              </span>
+              <span>Encrypt messages with a shared key</span>
+            </label>
+
+            {encryptEnabled && (
+              <>
+                <label className="field-label" htmlFor="psk" style={{ marginTop: 10 }}>
+                  Shared key
+                </label>
+                <div className="prompt">
+                  <span className="prompt-sign" aria-hidden="true">
+                    #
+                  </span>
+                  <input
+                    id="psk"
+                    type={showKey ? 'text' : 'password'}
+                    value={psk}
+                    disabled={txBusy}
+                    spellCheck={false}
+                    autoComplete="off"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    aria-describedby="psk-meta"
+                    onChange={(e) => changeKey(e.target.value, false)}
+                    onKeyDown={(e) => {
+                      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        inputRef.current?.focus();
+                      }
+                    }}
+                    placeholder="Type a key or generate one"
+                  />
+                </div>
+                <div id="psk-meta" className={`tx-meta${!keyGenerated && keyChars > 0 && keyChars < MIN_KEY_CHARS ? ' warn' : ''}`}>
+                  {keyHint}
+                </div>
+                <div className="actions key-actions">
+                  <button className="btn" onClick={() => setShowKey((v) => !v)}>
+                    {showKey ? 'Hide' : 'Show'}
+                  </button>
+                  <button
+                    className="btn"
+                    disabled={txBusy}
+                    title="Fill in a random 25-character key"
+                    onClick={() => {
+                      changeKey(generateKey(), true);
+                      setShowKey(true);
+                    }}
+                  >
+                    Generate
+                  </button>
+                </div>
+
+                <label className={`two-way${txBusy ? ' disabled' : ''}`} style={{ marginTop: 8 }}>
                   <input
                     type="checkbox"
                     checked={twoWay}
-                    disabled={txBusy}
+                    disabled={txBusy || !encryptEnabled}
                     aria-describedby="two-way-meta"
                     onChange={(e) => changeTwoWay(e.target.checked)}
                   />
-                  {/* The native checkbox stays for keyboards and screen readers; this shows its state. */}
                   <span className={`two-way-state ${twoWay ? 'on' : 'off'}`} aria-hidden="true">
-                    [ {twoWay ? 'ENABLED' : 'DISABLED'} ]
+                    {twoWay ? 'ON' : 'OFF'}
                   </span>
-                  <span>TWO-WAY · Diffie–Hellman session keys</span>
+                  <span>Two-way session (forward secrecy)</span>
                 </label>
                 {twoWay && (
                   <div className="tx-meta">
@@ -1542,37 +1662,35 @@ function App() {
                         <button
                           className="log-action"
                           disabled={txBusy}
-                          title="Use if the other device reloaded or reports a session it is not in: the next send starts a new handshake"
+                          title="Start a new handshake on the next send"
                           onClick={() => {
                             sessions.renew();
                             addLine({ tag: 'sys', mode: ENCRYPTED_LABEL, text: 'new session requested', note: 'the next send starts a handshake' });
                           }}
                         >
-                          NEW SESSION
+                          New session
                         </button>
                       </>
                     ) : (
-                      'no session yet · the next send starts one'
+                      'No session yet · the next send starts one'
                     )}
                   </div>
                 )}
-                {/* Collapsed by default; the checkbox is described by its contents either way. */}
                 <details className="two-way-about">
-                  <summary className="dim">requires a mic on both devices</summary>
+                  <summary className="dim">About encryption & two-way</summary>
                   <ul id="two-way-meta" className="tx-meta two-way-notes">
-                    <li>off: one-way · the receiver never answers</li>
-                    <li>on: the first send starts a session with a handshake the other device answers · both need TWO-WAY, the same key, and a working speaker and mic</li>
-                    <li>recordings stay sealed even if the key leaks later</li>
-                    <li>the session code identifies the session; matching codes do not prove who is on the other end</li>
-                    <li>NEW SESSION: if the other device reloaded, or says it is not in your session</li>
+                    <li>Encryption seals every frame with your shared key (AES-256-GCM).</li>
+                    <li>Both devices need the same key to read messages.</li>
+                    <li>Two-way adds a Diffie–Hellman handshake for forward secrecy (both need a working mic).</li>
+                    <li>Keys are never stored — they disappear when you close the tab.</li>
                   </ul>
                 </details>
-              </div>
-            </>
-          )}
+              </>
+            )}
+          </div>
 
           <label className="field-label" htmlFor="composer">
-            MESSAGE
+            Message
           </label>
           <div className="prompt">
             <span className="prompt-sign" aria-hidden="true">
@@ -1599,29 +1717,33 @@ function App() {
             />
           </div>
           {firstUse && (
-            <div className="tx-hint">open chirp on a second device, allow its mic, then send</div>
+            <div className="tx-hint">
+              Tip: open Chirp on another device, allow the microphone, choose the same mode (and key if encrypting), then press Send.
+              You can also Export a message as audio and Import it later.
+            </div>
           )}
           <div className={`tx-meta${overLimit ? ' err' : ''}`}>
-            {payloadBytes}/{mode.maxPayload} B
-            {payloadBytes > 0 && ` · ~${formatSeconds(messageAirtime(mode, payloadBytes))} airtime`}
+            {payloadBytes}/{effectiveMaxPayload} B
+            {payloadBytes > 0 && ` · ~${formatSeconds(messageAirtime(mode, payloadBytes, isEncrypted))} airtime`}
+            {isEncrypted && ' · encrypted'}
           </div>
 
-          <div className="actions">
+          <div className="actions tx-actions">
             {txBusy ? (
               <button className="btn btn-primary" onClick={() => transmitter.cancel()}>
-                [ <span className="key-hint">ESC </span>CANCEL ]
+                <span className="key">Esc</span> Cancel
               </button>
             ) : (
               <button className="btn btn-primary" onClick={() => void sendText(inputText)} disabled={!inputText || overLimit || keyMissing}>
-                [ ⏎ SEND ]
+                Send
               </button>
             )}
             <button className="btn" onClick={() => fileInputRef.current?.click()} disabled={txBusy || keyMissing}>
-              [ <span className="key">F</span>ILE ]
+              <span className="key">F</span> File
             </button>
             {lastFile && (
               <button className="btn" onClick={resendLastFile} disabled={txBusy || keyMissing} title={`Resend ${lastFile.file.name}`}>
-                [ <span className="key">R</span>ESEND {lastFile.file.name} ]
+                <span className="key">R</span> Resend
               </button>
             )}
             <button
@@ -1630,7 +1752,23 @@ function App() {
               disabled={txBusy || mic !== 'live'}
               title="Play a test frame and check that this device can hear it"
             >
-              [ <span className="key">T</span>EST ]
+              <span className="key">T</span> Test
+            </button>
+            <button
+              className="btn"
+              onClick={() => void exportTransmission()}
+              disabled={txBusy || (!inputText.trim() && !lastFile)}
+              title="Export the current message as a WAV file you can share"
+            >
+              Export
+            </button>
+            <button
+              className="btn"
+              onClick={() => importInputRef.current?.click()}
+              disabled={txBusy}
+              title="Import a previously exported WAV and decode it"
+            >
+              Import
             </button>
             <input
               ref={fileInputRef}
@@ -1642,10 +1780,21 @@ function App() {
                 if (file) void sendFile(file);
               }}
             />
+            <input
+              ref={importInputRef}
+              type="file"
+              accept="audio/*,.wav"
+              hidden
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = '';
+                if (file) void importAudioFile(file);
+              }}
+            />
           </div>
         </Panel>
 
-        <Panel title="LOG" right={`${log.length} lines`} className="p-log">
+        <Panel title="Activity" right={`${log.length} events`} className="p-log">
           <div
             className="log"
             ref={logRef}
@@ -1665,25 +1814,26 @@ function App() {
 
       <footer className="keybar">
         <span className="hotkeys">
-          <span className="key">⏎</span> send <span className="key">esc</span> cancel <span className="key">/</span> focus{' '}
-          <span className="key">alt+1–{MODES.length}</span> mode <span className="key">alt+f</span> file{' '}
-          <span className="key">alt+r</span> resend <span className="key">alt+t</span> test
+          <span className="key">↵</span> send
+          <span className="key">esc</span> cancel
+          <span className="key">/</span> focus
+          <span className="key">alt+1–{MODES.length}</span> mode
+          <span className="key">alt+f</span> file
+          <span className="key">alt+r</span> resend
+          <span className="key">alt+t</span> test
         </span>
         <span className="spacer" />
-        {/* A page of its own, so its sound demos can never play over this app's transfers. */}
         <a className="btn explain-toggle" href="/explain/">
-          [ ? EXPLAIN THIS ]
+          How it works
         </a>
-        <span className="credits">
-          built by{' '}
-          <a href="https://x.com/icesolst" target="_blank" rel="noopener noreferrer">
-            solst/ICE
-          </a>{' '}
-          ·{' '}
-          <a href="https://github.com/solst-ice/chirp" target="_blank" rel="noopener noreferrer">
-            code
-          </a>
-        </span>
+        <a
+          className="btn"
+          href="https://github.com/Nsoro-Allan/chirp"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          Source
+        </a>
       </footer>
     </div>
   );
