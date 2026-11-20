@@ -1423,7 +1423,6 @@ function App() {
     <div className="app" onClick={handleUserInteraction}>
       <header className="topbar">
         <span className="brand">Chirp.</span>
-        <span className="topbar-sub">[Acoustic modem]</span>
         <span className="spacer" />
         <span className={`state ${state.className}`}>{state.text}</span>
         {state.actions.map((action, i) => (
