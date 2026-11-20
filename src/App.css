@@ -65,12 +65,6 @@
   flex-shrink: 0;
 } */
 
-.topbar-sub {
-  font-size: 13px;
-  color: var(--fg-tertiary);
-  font-weight: 500;
-}
-
 .topbar .state {
   min-width: 0;
   max-width: 100%;
