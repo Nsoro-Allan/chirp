@@ -55,15 +55,7 @@
   padding: 0;
 }
 
-/* .brand::before {
-  content: '';
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 3px;
-  background: linear-gradient(135deg, var(--accent), var(--rx));
-  flex-shrink: 0;
-} */
+
 
 .topbar .state {
   min-width: 0;
